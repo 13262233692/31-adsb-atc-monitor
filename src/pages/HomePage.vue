@@ -7,7 +7,7 @@ import ControlPanel from '@/components/ControlPanel.vue'
 import StatusBar from '@/components/StatusBar.vue'
 import FlightDetail from '@/components/FlightDetail.vue'
 
-const { tracks, connected, connect, disconnect } = useWebSocket()
+const { tracks, conflicts, connected, connect, disconnect } = useWebSocket()
 const { state, selectTrack } = useRadarStore()
 
 const selectedTrackData = computed(() => {
@@ -40,11 +40,13 @@ onUnmounted(() => {
       :rangeNm="state.rangeNm"
       :trackCount="trackCount"
       :connected="connected"
+      :conflicts="conflicts"
     />
     <div class="flex flex-1 min-h-0">
       <div class="flex-1 relative">
         <RadarCanvas
           :tracks="tracks"
+          :conflicts="conflicts"
           :rangeNm="state.rangeNm"
           :centerLat="state.centerLat"
           :centerLon="state.centerLon"

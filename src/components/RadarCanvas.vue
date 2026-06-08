@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, watch } from 'vue'
 import { wgs84ToScreen } from '@/composables/useProjection'
-import type { RadarTrack } from '@/composables/useWebSocket'
+import type { RadarTrack, ConflictAlert } from '@/composables/useWebSocket'
 import type { ProjectionConfig } from '@/composables/useProjection'
 
 const props = defineProps<{
   tracks: ReadonlyMap<string, RadarTrack>
+  conflicts: ReadonlyArray<ConflictAlert>
   rangeNm: 10 | 20 | 40 | 80
   centerLat: number
   centerLon: number
@@ -54,6 +55,16 @@ interface LabelCacheEntry {
 const trailPool = new Map<string, TrailEntry>()
 const labelCache = new Map<string, LabelCacheEntry>()
 let cacheEvictionTimer: ReturnType<typeof setInterval> | null = null
+
+const conflictIcaoSet = new Set<string>()
+
+function rebuildConflictSet() {
+  conflictIcaoSet.clear()
+  for (const c of props.conflicts) {
+    conflictIcaoSet.add(c.pair[0])
+    conflictIcaoSet.add(c.pair[1])
+  }
+}
 
 const getProjectionConfig = (): ProjectionConfig => {
   const size = Math.min(logicalW, logicalH)
@@ -203,12 +214,12 @@ function drawTrails(cx: number, cy: number) {
   }
 }
 
-function buildLabelCacheKey(track: RadarTrack, isSelected: boolean): string {
-  return `${track.icao24}|${track.callsign}|${Math.round(track.altitude / 100)}|${Math.round(track.groundSpeed)}|${isSelected ? 1 : 0}`
+function buildLabelCacheKey(track: RadarTrack, isSelected: boolean, isConflict: boolean): string {
+  return `${track.icao24}|${track.callsign}|${Math.round(track.altitude / 100)}|${Math.round(track.groundSpeed)}|${isSelected ? 1 : 0}|${isConflict ? 1 : 0}`
 }
 
-function getOrCreateLabelCache(track: RadarTrack, isSelected: boolean): LabelCacheEntry | null {
-  const cacheKey = buildLabelCacheKey(track, isSelected)
+function getOrCreateLabelCache(track: RadarTrack, isSelected: boolean, isConflict: boolean): LabelCacheEntry | null {
+  const cacheKey = buildLabelCacheKey(track, isSelected, isConflict)
   const cached = labelCache.get(cacheKey)
   if (cached) {
     cached.lastAccess = Date.now()
@@ -234,11 +245,21 @@ function getOrCreateLabelCache(track: RadarTrack, isSelected: boolean): LabelCac
   const octx = oc.getContext('2d')
   if (!octx) return null
 
-  octx.fillStyle = 'rgba(10, 14, 20, 0.75)'
+  if (isConflict) {
+    octx.fillStyle = 'rgba(80, 0, 0, 0.85)'
+  } else {
+    octx.fillStyle = 'rgba(10, 14, 20, 0.75)'
+  }
   octx.fillRect(0, 0, boxW, boxH)
 
-  const textColor = isSelected ? '#00D4FF' : '#ffffff'
-  const dimColor = isSelected ? 'rgba(0, 212, 255, 0.7)' : 'rgba(200, 220, 200, 0.7)'
+  if (isConflict) {
+    octx.strokeStyle = '#FF2020'
+    octx.lineWidth = 1
+    octx.strokeRect(0, 0, boxW, boxH)
+  }
+
+  const textColor = isConflict ? '#FF4040' : isSelected ? '#00D4FF' : '#ffffff'
+  const dimColor = isConflict ? 'rgba(255, 120, 120, 0.8)' : isSelected ? 'rgba(0, 212, 255, 0.7)' : 'rgba(200, 220, 200, 0.7)'
 
   octx.font = 'bold 11px "JetBrains Mono", monospace'
   octx.fillStyle = textColor
@@ -278,14 +299,80 @@ function evictLabelCache() {
   }
 }
 
-function drawAircraft(cx: number, cy: number, track: RadarTrack, relX: number, relY: number, isSelected: boolean) {
+function drawConflictLines(cx: number, cy: number) {
+  if (!ctx || props.conflicts.length === 0) return
+  const config = getProjectionConfig()
+  const halfSize = config.canvasSize / 2
+  const t = performance.now() / 1000
+  const flashAlpha = 0.5 + 0.5 * Math.abs(Math.sin(t * 6))
+
+  for (const conflict of props.conflicts) {
+    const trackA = props.tracks.get(conflict.pair[0])
+    const trackB = props.tracks.get(conflict.pair[1])
+    if (!trackA || !trackB) continue
+
+    const posA = wgs84ToScreen(trackA.lat, trackA.lon, config)
+    const posB = wgs84ToScreen(trackB.lat, trackB.lon, config)
+    const ax = cx + posA.x - halfSize
+    const ay = cy + posA.y - halfSize
+    const bx = cx + posB.x - halfSize
+    const by = cy + posB.y - halfSize
+
+    ctx.save()
+    ctx.strokeStyle = conflict.severity === 'ALERT'
+      ? `rgba(255, 32, 32, ${flashAlpha})`
+      : `rgba(255, 160, 32, ${flashAlpha * 0.7})`
+    ctx.lineWidth = conflict.severity === 'ALERT' ? 2.5 : 1.5
+    ctx.setLineDash([6, 4])
+    ctx.beginPath()
+    ctx.moveTo(ax, ay)
+    ctx.lineTo(bx, by)
+    ctx.stroke()
+    ctx.setLineDash([])
+
+    if (conflict.severity === 'ALERT') {
+      ctx.strokeStyle = `rgba(255, 32, 32, ${flashAlpha * 0.3})`
+      ctx.lineWidth = 6
+      ctx.beginPath()
+      ctx.moveTo(ax, ay)
+      ctx.lineTo(bx, by)
+      ctx.stroke()
+    }
+
+    const midX = (ax + bx) / 2
+    const midY = (ay + by) / 2
+    ctx.font = 'bold 9px "JetBrains Mono", monospace'
+    ctx.fillStyle = conflict.severity === 'ALERT'
+      ? `rgba(255, 32, 32, ${flashAlpha})`
+      : `rgba(255, 160, 32, ${flashAlpha * 0.7})`
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'bottom'
+    const label = conflict.timeToConflict > 0
+      ? `${conflict.horizontalNm}NM ${conflict.timeToConflict}s`
+      : `${conflict.horizontalNm}NM NOW`
+    ctx.fillText(label, midX, midY - 3)
+
+    ctx.restore()
+  }
+}
+
+function drawAircraft(cx: number, cy: number, track: RadarTrack, relX: number, relY: number, isSelected: boolean, isConflict: boolean) {
   if (!ctx) return
   const x = cx + relX
   const y = cy + relY
   const headingRad = track.track * Math.PI / 180
   const size = 8
 
-  const color = isSelected ? '#00D4FF' : '#00FF41'
+  let color: string
+  if (isConflict) {
+    const t = performance.now() / 1000
+    const flash = Math.sin(t * 6) > 0
+    color = flash ? '#FF2020' : '#FF8040'
+  } else if (isSelected) {
+    color = '#00D4FF'
+  } else {
+    color = '#00FF41'
+  }
 
   ctx.save()
   ctx.translate(x, y)
@@ -302,15 +389,26 @@ function drawAircraft(cx: number, cy: number, track: RadarTrack, relX: number, r
 
   ctx.restore()
 
+  if (isConflict) {
+    const t = performance.now() / 1000
+    const pulse = 12 + Math.sin(t * 8) * 3
+    const alpha = 0.3 + 0.3 * Math.abs(Math.sin(t * 8))
+    ctx.strokeStyle = `rgba(255, 32, 32, ${alpha})`
+    ctx.lineWidth = 2
+    ctx.beginPath()
+    ctx.arc(x, y, pulse, 0, Math.PI * 2)
+    ctx.stroke()
+  }
+
   if (props.showVectors) {
     drawVelocityVector(x, y, track, color)
   }
 
   if (props.showLabels) {
-    drawDataLabelCached(x, y, track, isSelected)
+    drawDataLabelCached(x, y, track, isSelected, isConflict)
   }
 
-  if (isSelected) {
+  if (isSelected && !isConflict) {
     drawPulseRing(x, y)
   }
 }
@@ -335,9 +433,9 @@ function drawVelocityVector(x: number, y: number, track: RadarTrack, color: stri
   ctx.globalAlpha = 1
 }
 
-function drawDataLabelCached(x: number, y: number, track: RadarTrack, isSelected: boolean) {
+function drawDataLabelCached(x: number, y: number, track: RadarTrack, isSelected: boolean, isConflict: boolean) {
   if (!ctx) return
-  const cached = getOrCreateLabelCache(track, isSelected)
+  const cached = getOrCreateLabelCache(track, isSelected, isConflict)
   if (!cached) return
   const lx = x + 14
   const ly = y - 10
@@ -456,6 +554,9 @@ function render(timestamp: number) {
   updateTrails()
   drawTrails(cx, cy)
 
+  rebuildConflictSet()
+  drawConflictLines(cx, cy)
+
   const config = getProjectionConfig()
   const halfSize = config.canvasSize / 2
   const r2 = (radius + 20) * (radius + 20)
@@ -464,7 +565,7 @@ function render(timestamp: number) {
     const relX = pos.x - halfSize
     const relY = pos.y - halfSize
     if (relX * relX + relY * relY <= r2) {
-      drawAircraft(cx, cy, track, relX, relY, icao24 === props.selectedTrack)
+      drawAircraft(cx, cy, track, relX, relY, icao24 === props.selectedTrack, conflictIcaoSet.has(icao24))
     }
   }
 

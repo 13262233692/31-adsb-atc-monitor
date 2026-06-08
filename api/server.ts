@@ -4,6 +4,7 @@ import app from './app.js'
 import { parseAsterixCat021 } from './lib/asterix.js'
 import { createWSBroadcaster } from './lib/websocket.js'
 import { createSimulator, generateDirectTracks } from './lib/simulator.js'
+import { detectConflicts } from './lib/stca.js'
 import { incrementUdpCount, setStatusProvider, setSimulatorState } from './routes/radar.js'
 
 const PORT = process.env.PORT || 3001
@@ -59,6 +60,8 @@ for (const t of SEED_FLIGHTS) {
   broadcaster.updateTracks([t])
 }
 
+let stcaLogThrottle = 0
+
 const simInterval = setInterval(() => {
   const updatedTracks = []
   for (const [icao24, pos] of trackPositions) {
@@ -93,12 +96,28 @@ const simInterval = setInterval(() => {
     })
   }
   broadcaster.updateTracks(updatedTracks)
+
+  const allTracks = new Map(updatedTracks.map(t => [t.icao24, t]))
+  const conflicts = detectConflicts(allTracks)
+  broadcaster.updateConflicts(conflicts)
+
+  if (conflicts.length > 0) {
+    stcaLogThrottle++
+    if (stcaLogThrottle % 5 === 1) {
+      for (const c of conflicts) {
+        console.log(`[STCA] ${c.severity} ${c.callsigns[0]} <-> ${c.callsigns[1]} | H:${c.horizontalNm}NM V:${c.verticalFt}ft TTC:${c.timeToConflict}s`)
+      }
+    }
+  } else {
+    stcaLogThrottle = 0
+  }
 }, 1000)
 
 setStatusProvider(() => ({
   udpPacketRate: 0,
   trackCount: broadcaster.getTrackCount(),
   wsClientCount: broadcaster.getClientCount(),
+  conflictCount: broadcaster.getConflictCount(),
   simulatorRunning: true,
 }))
 
@@ -107,6 +126,7 @@ setSimulatorState(true)
 server.listen(PORT, () => {
   console.log(`[HTTP] Server ready on port ${PORT}`)
   console.log(`[WS] WebSocket available on ws://localhost:${PORT}`)
+  console.log(`[STCA] Conflict detection engine active (5NM / 1000ft / 120s)`)
 })
 
 process.on('SIGTERM', () => {

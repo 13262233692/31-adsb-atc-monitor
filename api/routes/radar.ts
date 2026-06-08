@@ -42,6 +42,7 @@ interface StatusPayload {
   udpPacketRate: number
   trackCount: number
   wsClientCount: number
+  conflictCount: number
   simulatorRunning: boolean
 }
 
@@ -65,6 +66,7 @@ router.get('/status', (_req: Request, res: Response) => {
         udpPacketRate: getUdpPacketRate(),
         trackCount: 0,
         wsClientCount: 0,
+        conflictCount: 0,
         simulatorRunning,
       },
     })

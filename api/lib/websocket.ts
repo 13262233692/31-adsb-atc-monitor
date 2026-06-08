@@ -1,16 +1,19 @@
 import { WebSocketServer, WebSocket } from 'ws'
 import type { Server } from 'http'
 import type { RadarTrack } from './asterix.js'
+import type { ConflictAlert } from './stca.js'
 
 interface RadarUpdate {
   type: 'track_update'
   tracks: RadarTrack[]
+  conflicts: ConflictAlert[]
   timestamp: number
 }
 
 export function createWSBroadcaster(server: Server) {
   const wss = new WebSocketServer({ server, path: '/' })
   const trackStore = new Map<string, RadarTrack>()
+  let lastConflicts: ConflictAlert[] = []
   let broadcastTimer: ReturnType<typeof setInterval> | null = null
 
   wss.on('connection', (ws: WebSocket) => {
@@ -19,6 +22,7 @@ export function createWSBroadcaster(server: Server) {
       const update: RadarUpdate = {
         type: 'track_update',
         tracks: Array.from(trackStore.values()),
+        conflicts: lastConflicts,
         timestamp: Date.now(),
       }
       ws.send(JSON.stringify(update))
@@ -45,11 +49,16 @@ export function createWSBroadcaster(server: Server) {
     }
   }
 
+  function updateConflicts(conflicts: ConflictAlert[]) {
+    lastConflicts = conflicts
+  }
+
   function broadcastNow() {
     if (wss.clients.size === 0) return
     const update: RadarUpdate = {
       type: 'track_update',
       tracks: Array.from(trackStore.values()),
+      conflicts: lastConflicts,
       timestamp: Date.now(),
     }
     const data = JSON.stringify(update)
@@ -80,15 +89,21 @@ export function createWSBroadcaster(server: Server) {
     return wss.clients.size
   }
 
+  function getConflictCount(): number {
+    return lastConflicts.length
+  }
+
   startBroadcasting(1000)
 
   return {
     updateTracks,
+    updateConflicts,
     broadcastNow,
     startBroadcasting,
     stopBroadcasting,
     getTrackCount,
     getClientCount,
+    getConflictCount,
     close: () => {
       stopBroadcasting()
       wss.close()

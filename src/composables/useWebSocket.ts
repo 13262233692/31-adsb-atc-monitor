@@ -12,9 +12,19 @@ export interface RadarTrack {
   timestamp: number
 }
 
+export interface ConflictAlert {
+  pair: [string, string]
+  callsigns: [string, string]
+  horizontalNm: number
+  verticalFt: number
+  timeToConflict: number
+  severity: 'WARNING' | 'ALERT'
+}
+
 interface RadarUpdate {
   type: 'track_update'
   tracks: RadarTrack[]
+  conflicts: ConflictAlert[]
   timestamp: number
 }
 
@@ -24,6 +34,7 @@ const MAX_TRACK_COUNT = 10000
 
 export function useWebSocket() {
   const tracks = ref<Map<string, RadarTrack>>(new Map())
+  const conflicts = ref<ConflictAlert[]>([])
   const connected = ref(false)
   const connecting = ref(false)
 
@@ -103,6 +114,12 @@ export function useWebSocket() {
             }
           }
           tracks.value = new Map(map)
+
+          if (Array.isArray(data.conflicts)) {
+            conflicts.value = data.conflicts
+          } else {
+            conflicts.value = []
+          }
         }
       } catch {
         // ignore parse errors
@@ -136,6 +153,7 @@ export function useWebSocket() {
     ws = null
     connected.value = false
     connecting.value = false
+    conflicts.value = []
   }
 
   onScopeDispose(() => {
@@ -144,6 +162,7 @@ export function useWebSocket() {
 
   return {
     tracks: readonly(tracks),
+    conflicts: readonly(conflicts),
     connected: readonly(connected),
     connecting: readonly(connecting),
     connect,
