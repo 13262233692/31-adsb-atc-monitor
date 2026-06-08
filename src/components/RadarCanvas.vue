@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, watch } from 'vue'
+import { ref, onMounted, onBeforeUnmount, watch } from 'vue'
 import { wgs84ToScreen } from '@/composables/useProjection'
 import type { RadarTrack } from '@/composables/useWebSocket'
 import type { ProjectionConfig } from '@/composables/useProjection'
@@ -28,11 +28,32 @@ let sweepAngle = 0
 let lastTimestamp = 0
 let logicalW = 0
 let logicalH = 0
-const trailHistory = new Map<string, { x: number; y: number }[]>()
+
 const SWEEP_RPM = 6
 const SWEEP_SPEED = (SWEEP_RPM * 360) / 60
 const AFTERGLOW_DEGREES = 30
 const MAX_TRAIL_POINTS = 20
+const TRAIL_TTL_MS = 30000
+const CACHE_TTL_MS = 30000
+const CACHE_EVICTION_MS = 10000
+const MAX_CACHE_SIZE = 2000
+
+interface TrailEntry {
+  points: { x: number; y: number }[]
+  lastUpdate: number
+}
+
+interface LabelCacheEntry {
+  canvas: OffscreenCanvas
+  width: number
+  height: number
+  cacheKey: string
+  lastAccess: number
+}
+
+const trailPool = new Map<string, TrailEntry>()
+const labelCache = new Map<string, LabelCacheEntry>()
+let cacheEvictionTimer: ReturnType<typeof setInterval> | null = null
 
 const getProjectionConfig = (): ProjectionConfig => {
   const size = Math.min(logicalW, logicalH)
@@ -163,16 +184,96 @@ function drawCrossHairs(cx: number, cy: number, radius: number) {
 
 function drawTrails(cx: number, cy: number) {
   if (!ctx || !props.showTrails) return
-  for (const [icao24, points] of trailHistory) {
+  const now = Date.now()
+  for (const [icao24, entry] of trailPool) {
+    if (now - entry.lastUpdate > TRAIL_TTL_MS) {
+      trailPool.delete(icao24)
+      continue
+    }
     const isSelected = icao24 === props.selectedTrack
+    const points = entry.points
     for (let i = 0; i < points.length; i++) {
       const p = points[i]
       const alpha = ((i + 1) / points.length) * 0.6
-      const color = isSelected ? `rgba(0, 212, 255, ${alpha})` : `rgba(0, 255, 65, ${alpha})`
-      ctx.fillStyle = color
-      ctx.beginPath()
-      ctx.arc(cx + p.x, cy + p.y, 1.5, 0, Math.PI * 2)
-      ctx.fill()
+      ctx.fillStyle = isSelected
+        ? `rgba(0,212,255,${alpha})`
+        : `rgba(0,255,65,${alpha})`
+      ctx.fillRect(cx + p.x - 1, cy + p.y - 1, 3, 3)
+    }
+  }
+}
+
+function buildLabelCacheKey(track: RadarTrack, isSelected: boolean): string {
+  return `${track.icao24}|${track.callsign}|${Math.round(track.altitude / 100)}|${Math.round(track.groundSpeed)}|${isSelected ? 1 : 0}`
+}
+
+function getOrCreateLabelCache(track: RadarTrack, isSelected: boolean): LabelCacheEntry | null {
+  const cacheKey = buildLabelCacheKey(track, isSelected)
+  const cached = labelCache.get(cacheKey)
+  if (cached) {
+    cached.lastAccess = Date.now()
+    return cached
+  }
+
+  const line1 = track.callsign || track.icao24
+  const fl = Math.round(track.altitude / 100)
+  const line2 = `FL${fl} ${Math.round(track.groundSpeed)}kt`
+
+  const tempCanvas = new OffscreenCanvas(200, 30)
+  const tctx = tempCanvas.getContext('2d')
+  if (!tctx) return null
+
+  tctx.font = 'bold 11px "JetBrains Mono", monospace'
+  const w1 = tctx.measureText(line1).width
+  tctx.font = '9px "JetBrains Mono", monospace'
+  const w2 = tctx.measureText(line2).width
+  const boxW = Math.max(w1, w2) + 10
+  const boxH = 30
+
+  const oc = new OffscreenCanvas(boxW, boxH)
+  const octx = oc.getContext('2d')
+  if (!octx) return null
+
+  octx.fillStyle = 'rgba(10, 14, 20, 0.75)'
+  octx.fillRect(0, 0, boxW, boxH)
+
+  const textColor = isSelected ? '#00D4FF' : '#ffffff'
+  const dimColor = isSelected ? 'rgba(0, 212, 255, 0.7)' : 'rgba(200, 220, 200, 0.7)'
+
+  octx.font = 'bold 11px "JetBrains Mono", monospace'
+  octx.fillStyle = textColor
+  octx.textAlign = 'left'
+  octx.textBaseline = 'top'
+  octx.fillText(line1, 4, 3)
+
+  octx.font = '9px "JetBrains Mono", monospace'
+  octx.fillStyle = dimColor
+  octx.fillText(line2, 4, 16)
+
+  const entry: LabelCacheEntry = {
+    canvas: oc,
+    width: boxW,
+    height: boxH,
+    cacheKey,
+    lastAccess: Date.now(),
+  }
+  labelCache.set(cacheKey, entry)
+  return entry
+}
+
+function evictLabelCache() {
+  const now = Date.now()
+  for (const [key, entry] of labelCache) {
+    if (now - entry.lastAccess > CACHE_TTL_MS) {
+      labelCache.delete(key)
+    }
+  }
+  if (labelCache.size > MAX_CACHE_SIZE) {
+    const entries = Array.from(labelCache.entries())
+      .sort((a, b) => a[1].lastAccess - b[1].lastAccess)
+    const overflow = labelCache.size - Math.floor(MAX_CACHE_SIZE * 0.7)
+    for (let i = 0; i < overflow && i < entries.length; i++) {
+      labelCache.delete(entries[i][0])
     }
   }
 }
@@ -206,7 +307,7 @@ function drawAircraft(cx: number, cy: number, track: RadarTrack, relX: number, r
   }
 
   if (props.showLabels) {
-    drawDataLabel(x, y, track, isSelected)
+    drawDataLabelCached(x, y, track, isSelected)
   }
 
   if (isSelected) {
@@ -224,51 +325,23 @@ function drawVelocityVector(x: number, y: number, track: RadarTrack, color: stri
   const endX = x + Math.cos(headingRad) * lineLength
   const endY = y + Math.sin(headingRad) * lineLength
 
-  const gradient = ctx.createLinearGradient(x, y, endX, endY)
-  gradient.addColorStop(0, color)
-  gradient.addColorStop(1, 'rgba(0, 255, 65, 0)')
-
-  ctx.strokeStyle = gradient
+  ctx.strokeStyle = color
+  ctx.globalAlpha = 0.6
   ctx.lineWidth = 1.5
   ctx.beginPath()
   ctx.moveTo(x, y)
   ctx.lineTo(endX, endY)
   ctx.stroke()
+  ctx.globalAlpha = 1
 }
 
-function drawDataLabel(x: number, y: number, track: RadarTrack, isSelected: boolean) {
+function drawDataLabelCached(x: number, y: number, track: RadarTrack, isSelected: boolean) {
   if (!ctx) return
-  const offsetX = 14
-  const offsetY = -10
-  const lx = x + offsetX
-  const ly = y + offsetY
-
-  const line1 = track.callsign || track.icao24
-  const fl = Math.round(track.altitude / 100)
-  const line2 = `FL${fl} ${Math.round(track.groundSpeed)}kt`
-
-  ctx.font = 'bold 11px "JetBrains Mono", monospace'
-  const w1 = ctx.measureText(line1).width
-  ctx.font = '9px "JetBrains Mono", monospace'
-  const w2 = ctx.measureText(line2).width
-  const boxW = Math.max(w1, w2) + 8
-  const boxH = 28
-
-  ctx.fillStyle = 'rgba(10, 14, 20, 0.75)'
-  ctx.fillRect(lx - 2, ly - 2, boxW, boxH)
-
-  const textColor = isSelected ? '#00D4FF' : '#ffffff'
-  const dimColor = isSelected ? 'rgba(0, 212, 255, 0.7)' : 'rgba(200, 220, 200, 0.7)'
-
-  ctx.font = 'bold 11px "JetBrains Mono", monospace'
-  ctx.fillStyle = textColor
-  ctx.textAlign = 'left'
-  ctx.textBaseline = 'top'
-  ctx.fillText(line1, lx + 2, ly + 2)
-
-  ctx.font = '9px "JetBrains Mono", monospace'
-  ctx.fillStyle = dimColor
-  ctx.fillText(line2, lx + 2, ly + 15)
+  const cached = getOrCreateLabelCache(track, isSelected)
+  if (!cached) return
+  const lx = x + 14
+  const ly = y - 10
+  ctx.drawImage(cached.canvas, lx - 2, ly - 2, cached.width, cached.height)
 }
 
 function drawPulseRing(x: number, y: number) {
@@ -284,12 +357,23 @@ function drawPulseRing(x: number, y: number) {
   ctx.stroke()
 }
 
+let vignetteGradient: CanvasGradient | null = null
+let vignetteW = 0
+let vignetteH = 0
+
 function drawVignette() {
   if (!ctx) return
-  const gradient = ctx.createRadialGradient(logicalW / 2, logicalH / 2, Math.min(logicalW, logicalH) * 0.25, logicalW / 2, logicalH / 2, Math.min(logicalW, logicalH) * 0.55)
-  gradient.addColorStop(0, 'rgba(0, 0, 0, 0)')
-  gradient.addColorStop(1, 'rgba(0, 0, 0, 0.5)')
-  ctx.fillStyle = gradient
+  if (!vignetteGradient || vignetteW !== logicalW || vignetteH !== logicalH) {
+    vignetteGradient = ctx.createRadialGradient(
+      logicalW / 2, logicalH / 2, Math.min(logicalW, logicalH) * 0.25,
+      logicalW / 2, logicalH / 2, Math.min(logicalW, logicalH) * 0.55
+    )
+    vignetteGradient.addColorStop(0, 'rgba(0, 0, 0, 0)')
+    vignetteGradient.addColorStop(1, 'rgba(0, 0, 0, 0.5)')
+    vignetteW = logicalW
+    vignetteH = logicalH
+  }
+  ctx.fillStyle = vignetteGradient
   ctx.fillRect(0, 0, logicalW, logicalH)
 }
 
@@ -302,23 +386,30 @@ function drawScanLines() {
 }
 
 function updateTrails() {
+  const now = Date.now()
   const config = getProjectionConfig()
   const halfSize = config.canvasSize / 2
+
+  const activeKeys = new Set<string>()
+
   for (const [icao24, track] of props.tracks) {
-    if (!trailHistory.has(icao24)) {
-      trailHistory.set(icao24, [])
+    activeKeys.add(icao24)
+    let entry = trailPool.get(icao24)
+    if (!entry) {
+      entry = { points: [], lastUpdate: now }
+      trailPool.set(icao24, entry)
     }
-    const points = trailHistory.get(icao24)!
+    entry.lastUpdate = now
     const pos = wgs84ToScreen(track.lat, track.lon, config)
-    points.push({ x: pos.x - halfSize, y: pos.y - halfSize })
-    if (points.length > MAX_TRAIL_POINTS) {
-      points.shift()
+    entry.points.push({ x: pos.x - halfSize, y: pos.y - halfSize })
+    if (entry.points.length > MAX_TRAIL_POINTS) {
+      entry.points.shift()
     }
   }
-  const currentKeys = new Set(props.tracks.keys())
-  for (const key of trailHistory.keys()) {
-    if (!currentKeys.has(key)) {
-      trailHistory.delete(key)
+
+  for (const [key, entry] of trailPool) {
+    if (!activeKeys.has(key) && now - entry.lastUpdate > TRAIL_TTL_MS) {
+      trailPool.delete(key)
     }
   }
 }
@@ -367,12 +458,12 @@ function render(timestamp: number) {
 
   const config = getProjectionConfig()
   const halfSize = config.canvasSize / 2
+  const r2 = (radius + 20) * (radius + 20)
   for (const [icao24, track] of props.tracks) {
     const pos = wgs84ToScreen(track.lat, track.lon, config)
     const relX = pos.x - halfSize
     const relY = pos.y - halfSize
-    const distFromCenter = Math.sqrt(relX * relX + relY * relY)
-    if (distFromCenter <= radius + 20) {
+    if (relX * relX + relY * relY <= r2) {
       drawAircraft(cx, cy, track, relX, relY, icao24 === props.selectedTrack)
     }
   }
@@ -395,6 +486,7 @@ function handleResize() {
   canvas.height = rect.height * dpr
   canvas.style.width = `${rect.width}px`
   canvas.style.height = `${rect.height}px`
+  vignetteGradient = null
 }
 
 function handleClick(e: MouseEvent) {
@@ -422,15 +514,26 @@ onMounted(() => {
   if (containerRef.value) {
     resizeObserver.observe(containerRef.value)
   }
+
+  cacheEvictionTimer = setInterval(evictLabelCache, CACHE_EVICTION_MS)
 })
 
-onUnmounted(() => {
+onBeforeUnmount(() => {
   if (animFrameId) cancelAnimationFrame(animFrameId)
   if (resizeObserver) resizeObserver.disconnect()
+  if (cacheEvictionTimer) {
+    clearInterval(cacheEvictionTimer)
+    cacheEvictionTimer = null
+  }
+  trailPool.clear()
+  labelCache.clear()
+  vignetteGradient = null
+  ctx = null
 })
 
 watch([() => props.rangeNm, () => props.centerLat, () => props.centerLon], () => {
-  trailHistory.clear()
+  trailPool.clear()
+  labelCache.clear()
 })
 </script>
 

@@ -1,4 +1,4 @@
-import { ref, readonly } from 'vue'
+import { ref, readonly, onScopeDispose } from 'vue'
 
 export interface RadarTrack {
   icao24: string
@@ -18,6 +18,10 @@ interface RadarUpdate {
   timestamp: number
 }
 
+const TRACK_TTL_MS = 30000
+const EVICTION_INTERVAL_MS = 5000
+const MAX_TRACK_COUNT = 10000
+
 export function useWebSocket() {
   const tracks = ref<Map<string, RadarTrack>>(new Map())
   const connected = ref(false)
@@ -26,6 +30,7 @@ export function useWebSocket() {
   let ws: WebSocket | null = null
   let reconnectAttempts = 0
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  let evictionTimer: ReturnType<typeof setInterval> | null = null
   let intentionalClose = false
 
   const getWsUrl = () => {
@@ -34,6 +39,33 @@ export function useWebSocket() {
   }
 
   const getMaxDelay = () => Math.min(1000 * Math.pow(2, reconnectAttempts), 30000)
+
+  function evictStaleTracks() {
+    const now = Date.now()
+    const current = tracks.value
+    let evicted = 0
+    for (const [key, track] of current) {
+      if (now - track.timestamp > TRACK_TTL_MS) {
+        current.delete(key)
+        evicted++
+      }
+    }
+    if (evicted > 0) {
+      tracks.value = new Map(current)
+    }
+  }
+
+  function startEvictionTimer() {
+    if (evictionTimer) return
+    evictionTimer = setInterval(evictStaleTracks, EVICTION_INTERVAL_MS)
+  }
+
+  function stopEvictionTimer() {
+    if (evictionTimer) {
+      clearInterval(evictionTimer)
+      evictionTimer = null
+    }
+  }
 
   const connect = () => {
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return
@@ -47,17 +79,30 @@ export function useWebSocket() {
       connected.value = true
       connecting.value = false
       reconnectAttempts = 0
+      startEvictionTimer()
     }
 
     ws.onmessage = (event) => {
       try {
         const data: RadarUpdate = JSON.parse(event.data)
         if (data.type === 'track_update' && Array.isArray(data.tracks)) {
-          const newMap = new Map(tracks.value)
+          const map = tracks.value
           for (const track of data.tracks) {
-            newMap.set(track.icao24, track)
+            map.set(track.icao24, track)
           }
-          tracks.value = newMap
+          if (map.size > MAX_TRACK_COUNT) {
+            const now = Date.now()
+            const entries = Array.from(map.entries())
+              .sort((a, b) => b[1].timestamp - a[1].timestamp)
+            const overflow = map.size - MAX_TRACK_COUNT
+            for (let i = entries.length - overflow; i < entries.length; i++) {
+              const [key, t] = entries[i]
+              if (now - t.timestamp > TRACK_TTL_MS / 2) {
+                map.delete(key)
+              }
+            }
+          }
+          tracks.value = new Map(map)
         }
       } catch {
         // ignore parse errors
@@ -67,6 +112,7 @@ export function useWebSocket() {
     ws.onclose = () => {
       connected.value = false
       connecting.value = false
+      stopEvictionTimer()
       if (!intentionalClose) {
         const delay = getMaxDelay()
         reconnectAttempts++
@@ -81,6 +127,7 @@ export function useWebSocket() {
 
   const disconnect = () => {
     intentionalClose = true
+    stopEvictionTimer()
     if (reconnectTimer) {
       clearTimeout(reconnectTimer)
       reconnectTimer = null
@@ -90,6 +137,10 @@ export function useWebSocket() {
     connected.value = false
     connecting.value = false
   }
+
+  onScopeDispose(() => {
+    disconnect()
+  })
 
   return {
     tracks: readonly(tracks),
